@@ -2,4 +2,3 @@
     remote = myremote
 ['remote "myremote"']
     url = gs://examply/dvc
-    credentialpath = ../sa-key.json
