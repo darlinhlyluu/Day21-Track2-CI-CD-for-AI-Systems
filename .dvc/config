@@ -1,5 +1,5 @@
 [core]
     remote = myremote
 ['remote "myremote"']
-    url = gs://<BUCKET>/dvc
+    url = gs://examply/dvc
     credentialpath = ../sa-key.json
