@@ -27,12 +27,6 @@ Trong quá trình làm bài, em gặp một số khó khăn chính:
 - **Dữ liệu bị cộng thêm sớm trước khi dựng lại flow**  
   Em đã từng chạy `add_new_data.py` sớm, làm `train_phase1.csv` chuyển sang trạng thái Bước 3. Em tạo thêm script `restore_phase1.py` để khôi phục về bộ dữ liệu gốc, sau đó mới dựng lại đúng thứ tự `Bước 1 -> Bước 2 -> Bước 3`.
 
-- **Lỗi branch và kích hoạt workflow**  
-  Repo gốc dùng `master` trong khi workflow của em lắng nghe `main`. Em đã đồng bộ branch làm việc sang `main`, push lại repo và đổi default branch trên GitHub để workflow kích hoạt đúng.
-
-- **Khó khăn khi deploy lên VM qua SSH**  
-  Em gặp lỗi private key/SSH authentication trong GitHub Actions. Em tạo riêng cặp khóa `mlops_deploy`, thêm public key vào `authorized_keys` trên VM, và cấu hình lại các secrets `VM_HOST`, `VM_USER`, `VM_SSH_KEY`.
-
 - **Lỗi phiên bản thư viện trên VM**  
   Lúc đầu VM dùng phiên bản `scikit-learn` khác với phiên bản khi train model, gây warning khi load model. Em tạo virtual environment riêng trên VM và cài đúng các version thư viện phù hợp với môi trường huấn luyện.
 
