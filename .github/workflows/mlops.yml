@@ -4,19 +4,23 @@ on:
   push:
     branches: [main]
     paths:
-      - 'data/**.dvc'
-      - 'src/**.py'
-      - 'params.yaml'
+      - "data/**.dvc"
+      - "src/**.py"
+      - "params.yaml"
+      - ".github/workflows/mlops.yml"
   workflow_dispatch:
 
-jobs:
+env:
+  GCS_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+  EVAL_THRESHOLD: "0.70"
+  LIVE_MODEL_KEY: models/latest/model.pkl
+  LIVE_METRICS_KEY: metrics/latest/metrics.json
+  LIVE_REPORT_KEY: reports/latest/report.txt
+  CANDIDATE_MODEL_KEY: models/candidates/${{ github.sha }}/model.pkl
+  CANDIDATE_METRICS_KEY: metrics/candidates/${{ github.sha }}.json
+  CANDIDATE_REPORT_KEY: reports/candidates/${{ github.sha }}.txt
 
-  # ---------------------------------------------------------------------------
-  # JOB 1 - UNIT TEST
-  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
-  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
-  # huan luyen hay trien khai.
-  # ---------------------------------------------------------------------------
+jobs:
   test:
     name: Unit Test
     runs-on: ubuntu-latest
@@ -31,21 +35,15 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
-        # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+        run: pytest tests/ -v
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 2 - TRAIN
-  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
-  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   train:
     name: Train
     needs: test
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+      previous_accuracy: ${{ steps.previous_metrics.outputs.accuracy }}
 
     steps:
       - uses: actions/checkout@v4
@@ -57,89 +55,170 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
+      - name: Configure MLflow tracking
         run: |
-          # <dien code o day>
+          if [ -n "${{ secrets.MLFLOW_TRACKING_URI }}" ]; then
+            echo "MLFLOW_TRACKING_URI=${{ secrets.MLFLOW_TRACKING_URI }}" >> $GITHUB_ENV
+            echo "MLFLOW_TRACKING_USERNAME=${{ secrets.MLFLOW_TRACKING_USERNAME }}" >> $GITHUB_ENV
+            echo "MLFLOW_TRACKING_PASSWORD=${{ secrets.MLFLOW_TRACKING_PASSWORD }}" >> $GITHUB_ENV
+            echo "MLFLOW_EXPERIMENT_NAME=wine-quality-ci" >> $GITHUB_ENV
+            echo "Using remote MLflow tracking."
+          else
+            echo "MLFLOW_TRACKING_URI=sqlite:///mlflow.db" >> $GITHUB_ENV
+            echo "MLFLOW_ARTIFACT_ROOT=./mlartifacts" >> $GITHUB_ENV
+            echo "MLFLOW_EXPERIMENT_NAME=wine-quality-local" >> $GITHUB_ENV
+            echo "Using local MLflow tracking."
+          fi
+
+      - name: Authenticate to Cloud Storage
+        run: |
+          echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
 
       - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
-        #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: # <dien lenh o day>
+        run: dvc pull data/train_phase1.csv.dvc data/eval.csv.dvc
 
       - name: Train model
         run: python src/train.py
 
       - name: Read metrics
         id: read_metrics
-        # TODO 4: Doc gia tri "accuracy" tu outputs/metrics.json bang Python inline.
-        #         Set ket qua thanh output "accuracy" de job deploy co the doc.
-        #
-        # Goi y:
-        #   ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
-        #   echo "accuracy=$ACC" >> $GITHUB_OUTPUT
         run: |
-          # <dien code o day>
+          ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
+          echo "accuracy=$ACC" >> $GITHUB_OUTPUT
 
-      - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.pkl len
-        #         <bucket>/models/latest/model.pkl.
-        #         Ten bucket lay tu secret CLOUD_BUCKET.
+      - name: Read previous deployed metrics
+        id: previous_metrics
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          import json
+          import os
+          from google.cloud import storage
+
+          client = storage.Client()
+          blob = client.bucket(os.environ["GCS_BUCKET"]).blob(os.environ["LIVE_METRICS_KEY"])
+          accuracy = ""
+
+          if blob.exists():
+              metrics = json.loads(blob.download_as_text())
+              accuracy = str(metrics.get("accuracy", ""))
+              print(f"Found previous deployed accuracy: {accuracy}")
+          else:
+              print("No previous deployed metrics found.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"accuracy={accuracy}\n")
           EOF
 
-      - name: Save metrics as artifact
+      - name: Upload candidate artifacts to Cloud Storage
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import storage
+
+          client = storage.Client()
+          bucket = client.bucket(os.environ["GCS_BUCKET"])
+
+          uploads = [
+              ("models/model.pkl", os.environ["CANDIDATE_MODEL_KEY"]),
+              ("outputs/metrics.json", os.environ["CANDIDATE_METRICS_KEY"]),
+              ("outputs/report.txt", os.environ["CANDIDATE_REPORT_KEY"]),
+          ]
+
+          for source_path, destination_key in uploads:
+              blob = bucket.blob(destination_key)
+              blob.upload_from_filename(source_path)
+              print(
+                  f"Uploaded {source_path} -> "
+                  f"gs://{os.environ['GCS_BUCKET']}/{destination_key}"
+              )
+          EOF
+
+      - name: Save training artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: outputs/metrics.json
+          name: training-artifacts
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 3 - EVAL
-  # Kiem tra nguong chat luong (accuracy >= 0.70).
-  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   eval:
     name: Eval
     needs: train
     runs-on: ubuntu-latest
     steps:
-
       - name: Check eval gate
-        # TODO 6: Doc accuracy tu output cua job train.
-        #         Neu accuracy < 0.70, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   acc = float("${{ needs.train.outputs.accuracy }}")
-        #   if acc < 0.70:
-        #       raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-        #   print("PASSED: dang trien khai model.")
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          threshold = float("${{ env.EVAL_THRESHOLD }}")
+          new_acc = float("${{ needs.train.outputs.accuracy }}")
+          previous_raw = "${{ needs.train.outputs.previous_accuracy }}"
+
+          print(f"Current candidate accuracy: {new_acc:.4f}")
+          if new_acc < threshold:
+              raise SystemExit(
+                  f"FAILED: accuracy {new_acc:.4f} < {threshold:.2f}. Huy deploy."
+              )
+
+          if previous_raw.strip():
+              previous_acc = float(previous_raw)
+              print(f"Previous deployed accuracy: {previous_acc:.4f}")
+              if new_acc < previous_acc:
+                  raise SystemExit(
+                      f"FAILED: accuracy moi {new_acc:.4f} thap hon model dang chay "
+                      f"{previous_acc:.4f}. Huy deploy de tranh rollback xau."
+                  )
+          else:
+              print("Khong co metrics cua phien ban truoc. Bo qua rollback gate.")
+
+          print("PASSED: model dat eval gate va rollback gate.")
           EOF
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
-  # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
     needs: eval
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deploy dependency
+        run: pip install google-cloud-storage==2.16.0
+
+      - name: Authenticate to Cloud Storage
+        run: |
+          echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
+
+      - name: Promote candidate artifacts to live paths
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import storage
+
+          client = storage.Client()
+          bucket = client.bucket(os.environ["GCS_BUCKET"])
+
+          promotions = [
+              (os.environ["CANDIDATE_MODEL_KEY"], os.environ["LIVE_MODEL_KEY"]),
+              (os.environ["CANDIDATE_METRICS_KEY"], os.environ["LIVE_METRICS_KEY"]),
+              (os.environ["CANDIDATE_REPORT_KEY"], os.environ["LIVE_REPORT_KEY"]),
+          ]
+
+          for source_key, destination_key in promotions:
+              source_blob = bucket.blob(source_key)
+              if not source_blob.exists():
+                  raise SystemExit(
+                      f"Missing candidate artifact "
+                      f"gs://{os.environ['GCS_BUCKET']}/{source_key}"
+                  )
+              bucket.copy_blob(source_blob, bucket, destination_key)
+              print(
+                  f"Promoted gs://{os.environ['GCS_BUCKET']}/{source_key} -> "
+                  f"gs://{os.environ['GCS_BUCKET']}/{destination_key}"
+              )
+          EOF
 
       - name: SSH deploy to VM
         uses: appleboy/ssh-action@v1.0.3
@@ -148,12 +227,15 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            # TODO 7: Restart service mlops-serve tren VM.
-            # TODO 8: Cho server san sang roi goi curl /health de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart mlops-serve
-            #   sleep 5
-            #   curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            sudo systemctl restart mlops-serve
+            for attempt in 1 2 3 4 5; do
+              echo "Health check attempt $attempt/5"
+              if curl -sf http://localhost:8000/health; then
+                echo "Health check passed."
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "Health check failed after 5 attempts."
+            sudo journalctl -u mlops-serve -n 50 --no-pager || true
+            exit 1
